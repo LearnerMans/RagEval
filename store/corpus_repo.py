@@ -1,3 +1,5 @@
+from store.base_repo import BaseRepo
+
 class CorpusRepo(BaseRepo):
     def __init__(self, conn):
         super().__init__(conn)

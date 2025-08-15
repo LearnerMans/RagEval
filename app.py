@@ -1,6 +1,7 @@
 import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from db.db import open, close
 from contextlib import asynccontextmanager
 
@@ -22,7 +23,7 @@ async def lifespan(app: FastAPI):
         # Initialize database connection
         logger.info("Initializing database connection...")
         global conn
-        conn = open("data/db.db")
+        conn = open("server/data/db.db")
         logger.info("Database connection initialized successfully")
         
         yield
@@ -44,6 +45,15 @@ async def lifespan(app: FastAPI):
 
 # Initialize FastAPI with lifespan
 app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],  # Vite dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Global connection variable
 conn = None
@@ -69,6 +79,12 @@ async def health_check():
     """Health check endpoint"""
     logger.info("Health check requested")
     return {"status": "healthy", "message": "Service is running"}
+
+# Import handlers
+from handlers.project_handler import router as project_router
+
+# Include routers
+app.include_router(project_router)
 
 # Root endpoint
 @app.get("/")

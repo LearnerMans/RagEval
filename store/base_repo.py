@@ -7,7 +7,11 @@ class BaseRepo:
        self._conn.commit()
     
     def fetch_one(self, sql, params=None):
+        if params is None:
+            return self._conn.execute(sql).fetchone()
         return self._conn.execute(sql, params).fetchone()
     
     def fetch_all(self, sql, params=None):
+        if params is None:
+            return self._conn.execute(sql).fetchall()
         return self._conn.execute(sql, params).fetchall()

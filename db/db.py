@@ -37,27 +37,40 @@ CREATE TABLE IF NOT EXISTS corpus_item (
   content_hash  TEXT NOT NULL,
   metadata_json TEXT,
   created_at    TEXT DEFAULT CURRENT_TIMESTAMP
-
-  file_path TEXT,                               -- e.g., /data/docs/a.pdf
-  original_filename TEXT,
-  file_size_bytes INTEGER,
-  mime_type TEXT,
-  fs_modified_time TEXT,
-  storage_backend TEXT,                         -- 'local'|'s3'...
-  storage_key TEXT,                             -- blob pointer if copied
-  ingested_at TEXT,
-
-  url TEXT,
-  url_normalized TEXT,
-  http_status_last INTEGER,
-  http_etag TEXT,
-  http_last_modified TEXT,
-  fetched_at TEXT,
-  fetch_error TEXT
-  
 );
 CREATE INDEX IF NOT EXISTS idx_corpus_item_corpus ON corpus_item(corpus_id);
 CREATE INDEX IF NOT EXISTS idx_corpus_item_hash ON corpus_item(content_hash);
+
+CREATE TABLE IF NOT EXISTS corpus_item_file (
+  id                TEXT PRIMARY KEY,
+  corpus_item_id    TEXT NOT NULL REFERENCES corpus_item(id) ON DELETE CASCADE,
+  file_path         TEXT,                               -- e.g., /data/docs/a.pdf
+  original_filename TEXT,
+  file_size_bytes   INTEGER,
+  mime_type         TEXT,
+  fs_modified_time  TEXT,
+  storage_backend   TEXT,                               -- 'local'|'s3'...
+  storage_key       TEXT,                               -- blob pointer if copied
+  ingested_at       TEXT,
+  created_at        TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_corpus_item_file_item ON corpus_item_file(corpus_item_id);
+CREATE INDEX IF NOT EXISTS idx_corpus_item_file_path ON corpus_item_file(file_path);
+
+CREATE TABLE IF NOT EXISTS corpus_item_url (
+  id                TEXT PRIMARY KEY,
+  corpus_item_id    TEXT NOT NULL REFERENCES corpus_item(id) ON DELETE CASCADE,
+  url               TEXT,
+  url_normalized    TEXT,
+  http_status_last  INTEGER,
+  http_etag         TEXT,
+  http_last_modified TEXT,
+  fetched_at        TEXT,
+  fetch_error       TEXT,
+  created_at        TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_corpus_item_url_item ON corpus_item_url(corpus_item_id);
+CREATE INDEX IF NOT EXISTS idx_corpus_item_url_normalized ON corpus_item_url(url_normalized);
 
 CREATE TABLE IF NOT EXISTS corpus_snapshot (
   id            TEXT PRIMARY KEY,
@@ -324,13 +337,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_run_kpi_run ON run_kpi(test_run_id);
 def open(db_path: str):
     """Open a single DB connection and initialize schema if not exists."""
     global _DB_CONN
-    if _DB_CONN is None:
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        conn.execute("PRAGMA foreign_keys = ON;")
-        conn.executescript(_SCHEMA_SQL)
-        _DB_CONN = conn
-        logger.info("Database connection established successfully")
+    if _DB_CONN is not None:
+        # Ensure row_factory is set on existing connection
+        if _DB_CONN.row_factory is None:
+            _DB_CONN.row_factory = sqlite3.Row
         return _DB_CONN
     
     db_file = Path(db_path)
@@ -342,6 +352,7 @@ def open(db_path: str):
         logger.info("Database connection established successfully")
         
         logger.info("Initializing database schema")
+        _DB_CONN.execute("PRAGMA foreign_keys = ON;")
         _DB_CONN.executescript(_SCHEMA_SQL)
         _DB_CONN.row_factory = sqlite3.Row
         logger.info("Database schema initialized successfully")

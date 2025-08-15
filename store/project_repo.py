@@ -1,10 +1,11 @@
+from store.base_repo import BaseRepo
 
 class ProjectRepo(BaseRepo):
     def __init__(self, conn):
         super().__init__(conn)
     
-    def create_project(self, name, description):
-        self.execute("INSERT INTO project (name, description) VALUES (?, ?)", (name, description))
+    def create_project(self, project_id, name, description):
+        self.execute("INSERT INTO project (id, name, description) VALUES (?, ?, ?)", (project_id, name, description))
     
     def get_project(self, project_id):
         return self.fetch_one("SELECT * FROM project WHERE id = ?", (project_id,))
