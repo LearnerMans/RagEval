@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from db.db import open, close
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(
@@ -23,7 +24,9 @@ async def lifespan(app: FastAPI):
         # Initialize database connection
         logger.info("Initializing database connection...")
         global conn
-        conn = open("server/data/db.db")
+        base_dir = Path(__file__).resolve().parent
+        db_path = base_dir / "data" / "db.db"
+        conn = open(str(db_path))
         logger.info("Database connection initialized successfully")
         
         yield
@@ -82,9 +85,11 @@ async def health_check():
 
 # Import handlers
 from handlers.project_handler import router as project_router
+from handlers.corpus_handler import router as corpus_router
 
 # Include routers
 app.include_router(project_router)
+app.include_router(corpus_router)
 
 # Root endpoint
 @app.get("/")
