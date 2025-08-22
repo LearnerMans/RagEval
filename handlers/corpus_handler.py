@@ -7,13 +7,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from pydantic import BaseModel
 
 from db.db import get_conn
 from store.project_repo import ProjectRepo
 from store.corpus_repo import CorpusRepo
 from store.corpus_item_repo import CorpusItemRepo
+
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ def _ensure_upload_dir(corpus_id: str) -> Path:
 def _safe_filename(name: str) -> str:
     keep = [c for c in name if c.isalnum() or c in (".", "-", "_", " ")]
     return "".join(keep).strip().replace(" ", "_") or "file"
+
 
 
 @router.post("/ingest", response_model=IngestResponse)
@@ -70,6 +72,7 @@ async def ingest_corpus(
                 try:
                     content = await up.read()
                     content_hash = hashlib.sha256(content).hexdigest()
+                   
 
                     # Save file
                     fname = f"{uuid.uuid4()}_{_safe_filename(up.filename or 'file')}"
@@ -156,3 +159,26 @@ async def ingest_corpus(
     except Exception as e:
         logger.error(f"Error ingesting corpus: {e}")
         raise HTTPException(status_code=500, detail="Failed to ingest corpus")
+
+@router.get("/projects/{project_id}")
+async def get_corpus(
+    project_id: str,
+    
+):
+    try:
+        conn = get_conn()
+        corpus_repo = CorpusRepo(conn)
+        logger.info(f"Fetching corpus: {project_id}")
+        
+        corpus =corpus_repo.get_corpus_by_project_id(project_id)
+        
+        if not corpus:
+            raise HTTPException(status_code=404, detail="Corpus not found")
+        
+        return corpus
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching corpus {project_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch corpus: {str(e)}")

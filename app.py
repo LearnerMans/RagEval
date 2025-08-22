@@ -3,6 +3,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from db.db import open, close
+from vector_db.chroma import open_client, close_client
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -26,7 +27,9 @@ async def lifespan(app: FastAPI):
         global conn
         base_dir = Path(__file__).resolve().parent
         db_path = base_dir / "data" / "db.db"
+        vector_db_path = base_dir / "data" / "vectordb.db"
         conn = open(str(db_path))
+        chroma_client = open_client(str(vector_db_path))
         logger.info("Database connection initialized successfully")
         
         yield
@@ -39,6 +42,7 @@ async def lifespan(app: FastAPI):
         logger.info("Application shutting down...")
         try:
             close()
+            close_client()
             logger.info("Database connection closed successfully")
         except Exception as e:
             logger.error(f"Error during application shutdown: {str(e)}")
@@ -60,6 +64,7 @@ app.add_middleware(
 
 # Global connection variable
 conn = None
+chroma_client = None
 
 # Middleware for request logging
 @app.middleware("http")

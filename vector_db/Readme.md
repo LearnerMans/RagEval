@@ -1,289 +1,306 @@
-Here’s a compact, production-ready helper you can drop into your codebase to run an **embedded ChromaDB** (on disk), create/get collections **tied to `project_id` and `test_id`**, bulk-upsert vectors, and query a specific collection (or all collections for a project/test).
+Here’s a clean, copy-pasteable guide for using your **embedded Chroma** utilities (and the singleton wrapper) end-to-end.
 
-```python
-# embedded_chroma.py
-from __future__ import annotations
+# Embedded Chroma — Usage Guide
 
-import os
-import re
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union, TypedDict
+## 1) Install & Setup
 
-try:
-    import chromadb
-except ImportError as e:
-    raise RuntimeError(
-        "chromadb is required. Install with:  pip install chromadb"
-    ) from e
-
-
-# ---------- Types ----------
-class UpsertItem(TypedDict, total=False):
-    id: str
-    embedding: Sequence[float]
-    document: Optional[str]
-    metadata: Dict[str, Any]
-
-QueryResult = List[Dict[str, Any]]  # [{id, distance, document, metadata, collection_name}]
-
-
-# ---------- Internal helpers ----------
-def _slug(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", s).strip("_").lower()
-
-def _derive_name(project_id: str, test_id: str, name: Optional[str]) -> str:
-    # A deterministic, readable collection name
-    base = f"proj={_slug(project_id)}__test={_slug(test_id)}"
-    return f"{base}__{_slug(name)}" if name else base
-
-def _ensure_dir(p: Union[str, Path]) -> str:
-    p = Path(p)
-    p.mkdir(parents=True, exist_ok=True)
-    return str(p)
-
-
-# ---------- Client / Collection ----------
-def init_chroma(persist_dir: str) -> "chromadb.api.client.ClientAPI":
-    """
-    Create (if needed) and open a local, embedded Chroma database in `persist_dir`.
-    Returns a PersistentClient.
-    """
-    path = _ensure_dir(persist_dir)
-    # Chroma 0.5+ API
-    if hasattr(chromadb, "PersistentClient"):
-        return chromadb.PersistentClient(path=path)
-    # Fallback for older versions
-    return chromadb.Client(chromadb.config.Settings(chroma_db_impl="duckdb+parquet", persist_directory=path))
-
-
-def get_or_create_collection(
-    client: "chromadb.api.client.ClientAPI",
-    *,
-    project_id: str,
-    test_id: str,
-    name: Optional[str] = None,
-    extra_metadata: Optional[Dict[str, Any]] = None,
-) -> "chromadb.api.models.Collection.Collection":
-    """
-    Get or create a collection bound to (project_id, test_id).
-    We encode (project_id, test_id) both in the collection metadata and in the collection name.
-    """
-    coll_name = _derive_name(project_id, test_id, name)
-    metadata = {"project_id": project_id, "test_id": test_id}
-    if extra_metadata:
-        metadata.update(extra_metadata)
-
-    # If collection exists, Chroma merges metadata (doesn't enforce equality), so we sanity-check.
-    try:
-        coll = client.get_collection(coll_name)
-        # Best-effort consistency check:
-        meta = getattr(coll, "metadata", {}) or {}
-        if meta.get("project_id") not in (None, project_id) or meta.get("test_id") not in (None, test_id):
-            raise ValueError(
-                f"Existing collection '{coll_name}' has conflicting metadata: {meta}. "
-                f"Expected project_id={project_id}, test_id={test_id}."
-            )
-        # Optionally update metadata if empty (Chroma doesn't expose update; ignore if not supported)
-        return coll
-    except Exception:
-        pass
-
-    # Create if missing
-    return client.get_or_create_collection(name=coll_name, metadata=metadata)  # embedding_function is optional
-
-
-# ---------- Bulk Upsert ----------
-def bulk_upsert(
-    client: "chromadb.api.client.ClientAPI",
-    *,
-    project_id: str,
-    test_id: str,
-    items: Sequence[UpsertItem],
-    name: Optional[str] = None,
-    default_metadata: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Bulk insert or update vectors into the (project_id, test_id[, name]) collection.
-    Each item should include: id (str), embedding (list[float]),
-    and optionally document (str) and metadata (dict).
-
-    Notes:
-      - If you already generate embeddings elsewhere, pass them here (recommended).
-      - This function does not depend on a collection-level embedding function.
-    """
-    if not items:
-        return
-
-    coll = get_or_create_collection(client, project_id=project_id, test_id=test_id, name=name)
-
-    ids: List[str] = []
-    embeddings: List[Sequence[float]] = []
-    documents: List[Optional[str]] = []
-    metadatas: List[Dict[str, Any]] = []
-
-    for it in items:
-        if "id" not in it or "embedding" not in it:
-            raise ValueError("Each item must include at least 'id' and 'embedding'.")
-        ids.append(it["id"])
-        embeddings.append(it["embedding"])
-        documents.append(it.get("document"))
-        md = dict(default_metadata or {})
-        md.update(it.get("metadata") or {})
-        # Ensure association is present on every row:
-        md.setdefault("project_id", project_id)
-        md.setdefault("test_id", test_id)
-        metadatas.append(md)
-
-    coll.upsert(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
-
-
-# ---------- Query (single collection) ----------
-def query_collection(
-    client: "chromadb.api.client.ClientAPI",
-    *,
-    project_id: str,
-    test_id: str,
-    name: Optional[str] = None,
-    query_embeddings: Sequence[Sequence[float]],
-    n_results: int = 10,
-    where: Optional[Mapping[str, Any]] = None,
-    where_document: Optional[Mapping[str, Any]] = None,
-) -> QueryResult:
-    """
-    Query a specific (project_id, test_id[, name]) collection using precomputed `query_embeddings`.
-    Returns a flat list of results: [{id, distance, document, metadata, collection_name}, ...]
-    """
-    coll = get_or_create_collection(client, project_id=project_id, test_id=test_id, name=name)
-    coll_name = _derive_name(project_id, test_id, name)
-
-    out = coll.query(
-        query_embeddings=list(query_embeddings),
-        n_results=n_results,
-        where=dict(where) if where else None,
-        where_document=dict(where_document) if where_document else None,
-    )
-
-    results: QueryResult = []
-    # Chroma returns lists per query vector; flatten them:
-    for ids, dists, docs, mds in zip(out.get("ids", []), out.get("distances", []), out.get("documents", []), out.get("metadatas", [])):
-        for i, _id in enumerate(ids):
-            results.append(
-                {
-                    "id": _id,
-                    "distance": dists[i] if dists else None,
-                    "document": docs[i] if docs else None,
-                    "metadata": mds[i] if mds else None,
-                    "collection_name": coll_name,
-                }
-            )
-    return results
-
-
-# ---------- Query (all collections for a project/test) ----------
-def query_project_test(
-    client: "chromadb.api.client.ClientAPI",
-    *,
-    project_id: str,
-    test_id: str,
-    query_embeddings: Sequence[Sequence[float]],
-    n_results_per_collection: int = 10,
-    where: Optional[Mapping[str, Any]] = None,
-    where_document: Optional[Mapping[str, Any]] = None,
-) -> QueryResult:
-    """
-    Query across *all* collections that belong to (project_id, test_id) and merge results.
-    Results are sorted by ascending distance (when available).
-    """
-    # Find matching collections by metadata/name convention
-    matching = []
-    prefix = _derive_name(project_id, test_id, None)  # "proj=..__test=.."
-    for c in client.list_collections():
-        try:
-            meta = getattr(c, "metadata", {}) or {}
-            if meta.get("project_id") == project_id and meta.get("test_id") == test_id:
-                matching.append(c)
-            elif c.name.startswith(prefix):
-                matching.append(c)
-        except Exception:
-            # Be permissive; skip on any unexpected shape
-            continue
-
-    merged: QueryResult = []
-    for coll in matching:
-        out = coll.query(
-            query_embeddings=list(query_embeddings),
-            n_results=n_results_per_collection,
-            where=dict(where) if where else None,
-            where_document=dict(where_document) if where_document else None,
-        )
-        for ids, dists, docs, mds in zip(out.get("ids", []), out.get("distances", []), out.get("documents", []), out.get("metadatas", [])):
-            for i, _id in enumerate(ids):
-                merged.append(
-                    {
-                        "id": _id,
-                        "distance": dists[i] if dists else None,
-                        "document": docs[i] if docs else None,
-                        "metadata": mds[i] if mds else None,
-                        "collection_name": coll.name,
-                    }
-                )
-
-    # Sort when distances are present
-    merged.sort(key=lambda r: (float("inf") if r["distance"] is None else r["distance"]))
-    return merged
-
-
-# ---------- (Optional) Utilities ----------
-def list_collections_for(
-    client: "chromadb.api.client.ClientAPI", *, project_id: str, test_id: str
-) -> List[str]:
-    """List collection names associated with (project_id, test_id)."""
-    names: List[str] = []
-    prefix = _derive_name(project_id, test_id, None)
-    for c in client.list_collections():
-        meta = getattr(c, "metadata", {}) or {}
-        if meta.get("project_id") == project_id and meta.get("test_id") == test_id:
-            names.append(c.name)
-        elif c.name.startswith(prefix):
-            names.append(c.name)
-    return sorted(set(names))
+```bash
+pip install chromadb
 ```
 
-### How to use
+Project layout (suggested):
+
+```
+your_app/
+  embedded_chroma.py         # your helpers (init/get_or_create/bulk_upsert/query/…)
+  chroma_singleton.py        # the singleton client wrapper I shared
+  run_example.py             # your app/tests
+```
+
+---
+
+## 2) Quick Start (TL;DR)
 
 ```python
-from embedded_chroma import init_chroma, get_or_create_collection, bulk_upsert, query_collection, query_project_test
+# run_example.py
+from chroma_singleton import open_client, get_client, close_client
+from embedded_chroma import (
+    get_or_create_collection,
+    bulk_upsert,
+    query_collection,
+    query_project_test,
+    list_collections_for,
+)
 
-# 1) Start embedded DB (stored under ./vectorstore)
-client = init_chroma("./vectorstore")
+# 1) Start Chroma (once per process)
+client = open_client("./.chroma_store")
 
-# 2) Create/get a collection for a project & test (name is optional)
-coll = get_or_create_collection(client, project_id="proj_123", test_id="test_A", name="chunks_v1")
-
-# 3) Bulk upsert (you provide embeddings)
+# 2) Upsert some vectors into a (project_id, test_id[, name]) collection
 items = [
-    {"id": "doc-1#0", "embedding": [0.01, 0.2, ...], "document": "First chunk text", "metadata": {"source": "pdf", "chunk_index": 0}},
-    {"id": "doc-1#1", "embedding": [0.05, 0.1, ...], "document": "Second chunk text", "metadata": {"source": "pdf", "chunk_index": 1}},
+    {
+        "id": "doc-1",
+        "embedding": [0.1, 0.2, 0.3],  # your precomputed embedding
+        "document": "Hello world",
+        "metadata": {"type": "greeting", "lang": "en"},
+    },
+    {
+        "id": "doc-2",
+        "embedding": [0.0, 0.1, 0.4],
+        "document": "Merhaba dünya",
+        "metadata": {"type": "greeting", "lang": "tr"},
+    },
 ]
-bulk_upsert(client, project_id="proj_123", test_id="test_A", name="chunks_v1", items=items)
+bulk_upsert(
+    get_client(),
+    project_id="mohap",
+    test_id="t1",
+    items=items,
+    name="default",  # optional sub-collection name
+)
 
-# 4) Query a specific collection (using your own query embeddings)
-q_emb = [[0.02, 0.18, ...]]
-hits = query_collection(client, project_id="proj_123", test_id="test_A", name="chunks_v1", query_embeddings=q_emb, n_results=5)
+# 3) Query a single collection with a query embedding
+q = [[0.09, 0.19, 0.31]]  # 1 query vector (same dimension as your items)
+hits = query_collection(
+    get_client(),
+    project_id="mohap",
+    test_id="t1",
+    name="default",
+    query_embeddings=q,
+    n_results=5,
+)
+print("Single-collection hits:", hits)
 
-# 5) Or query across all collections for (project_id, test_id)
-hits_all = query_project_test(client, project_id="proj_123", test_id="test_A", query_embeddings=q_emb, n_results_per_collection=3)
+# 4) Or query across all collections under (project_id, test_id)
+hits_all = query_project_test(
+    get_client(),
+    project_id="mohap",
+    test_id="t1",
+    query_embeddings=q,
+    n_results_per_collection=3,
+)
+print("Cross-collection hits:", hits_all)
+
+# 5) List collection names for a project/test
+names = list_collections_for(get_client(), project_id="mohap", test_id="t1")
+print("Collections:", names)
+
+# 6) Shutdown (optional; resets the singleton)
+close_client()
 ```
 
-**Notes & design choices**
+---
 
-* Uses **embedded** Chroma (on-disk) via `PersistentClient(path=...)`. No server required.
-* Each collection is **namespaced** and **tagged** by `project_id` and `test_id`:
+## 3) Concepts
 
-  * In the **collection name** (e.g., `proj=proj_123__test=test_A__chunks_v1`)
-  * In **collection metadata** (`{"project_id": "...", "test_id": "..."}`)
-  * Also stamped onto every row’s metadata on upsert, so you can filter later if you merge data.
-* You supply embeddings (fits your pipeline that already stores configs/embeddings in SQLite).
-* `query_project_test(...)` optionally aggregates results **across multiple collections** for the same `(project_id, test_id)` and sorts by distance.
+* **Persist directory**: local folder Chroma uses (DuckDB + Parquet). One per environment is typical (e.g., `./.chroma_store`).
+* **Collections**: logical buckets; here they’re **namespaced by** `project_id` + `test_id` (+ optional `name`).
+  Your helper builds stable names like `proj=mohap__test=t1__default`.
+* **Embeddings**: you pass **precomputed** vectors (recommended). All vectors in a collection must share the **same dimension**.
 
-If you want, I can add a thin adapter that reads chunk embeddings out of your `chunk` table (by `index_build_id`) and bulk-upserts them straight into the appropriate Chroma collection.
+---
+
+## 4) Lifecycle: Open / Get / Close (Singleton)
+
+Use the singleton so you don’t accidentally open multiple clients to the same store.
+
+```python
+from chroma_singleton import open_client, get_client, close_client
+
+# Open (idempotent)
+open_client("./.chroma_store")
+
+# Get the active client anywhere in your code
+client = get_client()
+
+# Close/reset when your app ends or between tests
+close_client()
+```
+
+**Why singleton?**
+
+* Avoids corruption/races from multiple writers to the same `persist_dir`.
+* Central place to do health checks.
+* Thread-safe initialization with a lock.
+
+---
+
+## 5) Creating / Fetching a Collection
+
+```python
+from embedded_chroma import get_or_create_collection
+
+coll = get_or_create_collection(
+    client=get_client(),
+    project_id="mohap",
+    test_id="t1",
+    name="default",  # optional (sub-collection)
+    extra_metadata={"owner": "abdullah"},  # optional metadata
+)
+```
+
+* The helper verifies metadata consistency if the collection already exists.
+* The `(project_id, test_id)` are also stamped into **each row’s metadata** during upserts (defensive).
+
+---
+
+## 6) Bulk Upsert
+
+```python
+from embedded_chroma import bulk_upsert, UpsertItem
+
+items: list[UpsertItem] = [
+    {"id": "a", "embedding": [0.1, 0.2, 0.3], "document": "A doc", "metadata": {"topic": "alpha"}},
+    {"id": "b", "embedding": [0.2, 0.1, 0.0], "document": "B doc", "metadata": {"topic": "beta"}},
+]
+
+bulk_upsert(
+    client=get_client(),
+    project_id="mohap",
+    test_id="t1",
+    items=items,
+    name="default",
+    default_metadata={"source": "ingest_v1"},  # merged into each item’s metadata
+)
+```
+
+**Rules**
+
+* Each `item` must have `id` and `embedding`.
+* `default_metadata` is merged with `item["metadata"]`.
+* `project_id` and `test_id` are auto-added if missing.
+
+---
+
+## 7) Querying
+
+### 7.1 Single Collection
+
+```python
+from embedded_chroma import query_collection
+
+query_vecs = [[0.09, 0.19, 0.31]]  # one or more query vectors
+
+results = query_collection(
+    client=get_client(),
+    project_id="mohap",
+    test_id="t1",
+    name="default",
+    query_embeddings=query_vecs,
+    n_results=5,
+    where={"lang": "en"},                # filter by metadata (optional)
+    where_document={"$contains": "Hello"}  # filter by document text (optional)
+)
+
+# Result shape (flattened):
+# [
+#   {
+#     "id": "doc-1",
+#     "distance": 0.123,                 # lower is closer (depending on metric)
+#     "document": "Hello world",
+#     "metadata": {"type": "greeting", "lang": "en", "project_id": "...", "test_id": "..."},
+#     "collection_name": "proj=...__test=...__default",
+#   },
+#   ...
+# ]
+```
+
+### 7.2 Across All Collections of (project\_id, test\_id)
+
+```python
+from embedded_chroma import query_project_test
+
+results = query_project_test(
+    client=get_client(),
+    project_id="mohap",
+    test_id="t1",
+    query_embeddings=[[0.09, 0.19, 0.31]],
+    n_results_per_collection=3,
+    where={"type": "greeting"},
+)
+# Returns a unified, distance-sorted list across all matching collections.
+```
+
+---
+
+## 8) Listing Collections
+
+```python
+from embedded_chroma import list_collections_for
+
+names = list_collections_for(get_client(), project_id="mohap", test_id="t1")
+print(names)
+# -> ['proj=mohap__test=t1__default', 'proj=mohap__test=t1__rules', ...]
+```
+
+---
+
+## 9) Filters (Metadata & Document)
+
+* `where` works on the **metadata** dict you upserted with each item. Examples:
+
+  * Exact match: `{"lang": "en"}`
+  * In-list: `{"lang": {"$in": ["en", "tr"]}}`
+  * Not equal: `{"type": {"$ne": "spam"}}`
+  * Numeric compare: `{"score": {"$gt": 0.5}}`
+* `where_document` works on the **document text** (if stored). Examples:
+
+  * Contains substring: `{"$contains": "invoice"}`
+  * Regex (if supported by your Chroma version).
+
+> Filtering operators vary a bit by Chroma version—keep it simple (eq/in/contains) for portability.
+
+---
+
+## 10) Best Practices
+
+* **Consistent embedding model** per collection. Don’t mix dimensions or models.
+* **Stable IDs**: use deterministic IDs (e.g., hash of file path + version) so re-ingests upsert cleanly.
+* **Chunking strategy**: if storing long docs, chunk and upsert per chunk with shared metadata (`doc_id`, `page`, etc.).
+* **Backups**: the persist dir is just files—snapshot/backup like any app data.
+* **Concurrency**: one client per process; don’t share the Python object across processes. Within a process the singleton is thread-safe on open/close.
+* **Testing**: point the singleton to a temp dir per test; call `close_client()` between tests.
+
+---
+
+## 11) Minimal API Reference
+
+### `chroma_singleton.py`
+
+* `open_client(persist_dir: str) -> ClientAPI`
+  Idempotent; initializes (and verifies) the store at `persist_dir`.
+* `get_client() -> ClientAPI`
+  Returns the active client or raises if unopened.
+* `close_client() -> None`
+  Resets the global handle (tidy shutdown / test isolation).
+
+### `embedded_chroma.py`
+
+* `init_chroma(persist_dir: str) -> ClientAPI`
+  (If you prefer not to use the singleton.)
+* `get_or_create_collection(client, *, project_id, test_id, name=None, extra_metadata=None) -> Collection`
+* `bulk_upsert(client, *, project_id, test_id, items, name=None, default_metadata=None) -> None`
+* `query_collection(client, *, project_id, test_id, name=None, query_embeddings, n_results=10, where=None, where_document=None) -> list[dict]`
+* `query_project_test(client, *, project_id, test_id, query_embeddings, n_results_per_collection=10, where=None, where_document=None) -> list[dict]`
+* `list_collections_for(client, *, project_id, test_id) -> list[str]`
+
+---
+
+## 12) Common Pitfalls & Fixes
+
+* **Dimension mismatch**:
+
+  > `ValueError: Expected embedding dimension X but got Y`
+  > Ensure your query vectors and upserted vectors use the same model/dimension.
+
+* **Empty query results** with filters:
+  Loosen filters (start with no `where`/`where_document`), then add back gradually.
+
+* **Multiple stores accidentally**:
+  If you see odd “missing data,” confirm you’re opening the same `persist_dir` everywhere. The singleton blocks mismatched paths.
+
+* **Performance**:
+  Batch upserts (you already do), and prefer fewer, larger calls over many tiny ones.
+
+---
+
+That’s it. If you want, I can add a tiny wrapper so your call sites don’t need to pass `client=` at all (each helper can default to `get_client()` internally), while keeping an override for tests.
